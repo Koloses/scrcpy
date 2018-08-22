@@ -9,14 +9,20 @@
 #include "config.h"
 #include "events.h"
 #include "frames.h"
-#include "lock_util.h"
+#include "lockutil.h"
 #include "log.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bcm_host.h"
+#include "ilclient.h"
 
 #define BUFSIZE 0x10000
 
-static int read_packet(void *opaque, uint8_t *buf, int buf_size) {
+static int read_packet(void *opaque, uint8_t *buffer) {
     struct decoder *decoder = opaque;
-    return net_recv(decoder->video_socket, buf, buf_size);
+    return net_recv(decoder->video_socket, buffer, BUFSIZE);
 }
 
 // set the decoded frame as ready for rendering, and notify
@@ -32,6 +38,7 @@ static void push_frame(struct decoder *decoder) {
     SDL_PushEvent(&new_frame_event);
 }
 
+
 static void notify_stopped(void) {
     SDL_Event stop_event;
     stop_event.type = EVENT_DECODER_STOPPED;
@@ -41,109 +48,153 @@ static void notify_stopped(void) {
 static int run_decoder(void *data) {
     struct decoder *decoder = data;
 
-    AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-    if (!codec) {
-        LOGE("H.264 decoder not found");
-        goto run_end;
-    }
+//-------------------------------------------
+// Start of changes - add video_decode component from ilclient openmax
+//  For compilation put scrcpy under /opt/vc/src/hello_pi folder and use this settings: -lilclient -L/opt/vc/lib/ -lbrcmGLESv2 -lbrcmEGL -lopenmaxil -lbcm_host -lvcos //  -lvchiq_arm -lpthread -lrt -lm -L/opt/vc/src/hello_pi/libs/ilclient -L/opt/vc/src/hello_pi/libs/vgfont -Wl,--no-whole-archive -rdynamic
+//-------------------------------------------
 
-    AVCodecContext *codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
-        LOGC("Could not allocate decoder context");
-        goto run_end;
-    }
 
-    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
-        LOGE("Could not open H.264 codec");
-        goto run_finally_free_codec_ctx;
-    }
+   OMX_VIDEO_PARAM_PORTFORMATTYPE format;
+   COMPONENT_T *video_decode = NULL;
+   COMPONENT_T *list[5];
+   ILCLIENT_T *client;
+   FILE *in;
+   int status = 0;
+   unsigned int data_len = 0;
 
-    AVFormatContext *format_ctx = avformat_alloc_context();
-    if (!format_ctx) {
-        LOGC("Could not allocate format context");
-        goto run_finally_close_codec;
-    }
+   memset(list, 0, sizeof(list));
 
-    unsigned char *buffer = av_malloc(BUFSIZE);
-    if (!buffer) {
-        LOGC("Could not allocate buffer");
-        goto run_finally_free_format_ctx;
-    }
+   if((client = ilclient_init()) == NULL)
+   {
+      fclose(in);
+      return -3;
+   }
 
-    AVIOContext *avio_ctx = avio_alloc_context(buffer, BUFSIZE, 0, decoder, read_packet, NULL, NULL);
-    if (!avio_ctx) {
-        LOGC("Could not allocate avio context");
-        // avformat_open_input takes ownership of 'buffer'
-        // so only free the buffer before avformat_open_input()
-        av_free(buffer);
-        goto run_finally_free_format_ctx;
-    }
+   if(OMX_Init() != OMX_ErrorNone)
+   {
+      ilclient_destroy(client);
+      fclose(in);
+      return -4;
+   }
 
-    format_ctx->pb = avio_ctx;
+   // create video_decode
+   if(ilclient_create_component(client, &video_decode, "video_decode", ILCLIENT_DISABLE_ALL_PORTS | ILCLIENT_ENABLE_INPUT_BUFFERS) != 0)
+      status = -14;
+   list[0] = video_decode;
 
-    if (avformat_open_input(&format_ctx, NULL, NULL, NULL) < 0) {
-        LOGE("Could not open video stream");
-        goto run_finally_free_avio_ctx;
-    }
 
-    AVPacket packet;
-    av_init_packet(&packet);
-    packet.data = NULL;
-    packet.size = 0;
+   memset(&cstate, 0, sizeof(cstate));
+   cstate.nSize = sizeof(cstate);
+   cstate.nVersion.nVersion = OMX_VERSION;
+   cstate.eState = OMX_TIME_ClockStateWaitingForStartTime;
+   cstate.nWaitMask = 1;
 
-    while (!av_read_frame(format_ctx, &packet)) {
-// the new decoding/encoding API has been introduced by:
-// <http://git.videolan.org/?p=ffmpeg.git;a=commitdiff;h=7fc329e2dd6226dfecaa4a1d7adf353bf2773726>
-#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 37, 0)
-        int ret;
-        if ((ret = avcodec_send_packet(codec_ctx, &packet)) < 0) {
-            LOGE("Could not send video packet: %d", ret);
-            goto run_quit;
-        }
-        ret = avcodec_receive_frame(codec_ctx, decoder->frames->decoding_frame);
-        if (!ret) {
-            // a frame was received
-            push_frame(decoder);
-        } else if (ret != AVERROR(EAGAIN)) {
-            LOGE("Could not receive video frame: %d", ret);
-            av_packet_unref(&packet);
-            goto run_quit;
-        }
-#else
-        while (packet.size > 0) {
-            int got_picture;
-            int len = avcodec_decode_video2(codec_ctx, decoder->frames->decoding_frame, &got_picture, &packet);
-            if (len < 0) {
-                LOGE("Could not decode video packet: %d", len);
-                goto run_quit;
-            }
-            if (got_picture) {
-                push_frame(decoder);
-            }
-            packet.size -= len;
-            packet.data += len;
-        }
-#endif
-        av_packet_unref(&packet);
+   if(status == 0)
+      ilclient_change_component_state(video_decode, OMX_StateIdle);
 
-        if (avio_ctx->eof_reached) {
+   memset(&format, 0, sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE));
+   format.nSize = sizeof(OMX_VIDEO_PARAM_PORTFORMATTYPE);
+   format.nVersion.nVersion = OMX_VERSION;
+   format.nPortIndex = 130;
+   format.eCompressionFormat = OMX_VIDEO_CodingAVC;
+
+   if(status == 0 &&
+      OMX_SetParameter(ILC_GET_HANDLE(video_decode), OMX_IndexParamVideoPortFormat, &format) == OMX_ErrorNone &&
+      ilclient_enable_port_buffers(video_decode, 130, NULL, NULL, NULL) == 0)
+   {
+      OMX_BUFFERHEADERTYPE *buf;
+      int port_settings_changed = 0;
+      int first_packet = 1;
+
+      ilclient_change_component_state(video_decode, OMX_StateExecuting);
+
+      while((buf = ilclient_get_input_buffer(video_decode, 130, 1)) != NULL)
+      {
+
+// feed data and wait until we get port settings changed
+
+         unsigned char *dest = buf->pBuffer;
+
+         data_len += fread(dest, 1, buf->nAllocLen-data_len, decoder->video_socket);
+         if(port_settings_changed == 0 &&
+            ((data_len > 0 && ilclient_remove_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1) == 0) ||
+        if(port_settings_changed == 0 &&
+            ((data_len > 0 && ilclient_remove_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1) == 0) ||
+             (data_len == 0 && ilclient_wait_for_event(video_decode, OMX_EventPortSettingsChanged, 131, 0, 0, 1,
+                                                       ILCLIENT_EVENT_ERROR | ILCLIENT_PARAMETER_CHANGED, 10000) == 0)))
+         {
+            port_settings_changed = 1;
+         }
+         if(!data_len)
             break;
-        }
-    }
 
+         buf->nFilledLen = data_len;
+         data_len = 0;
+
+         buf->nOffset = 0;
+         if(first_packet)
+         {
+            buf->nFlags = OMX_BUFFERFLAG_STARTTIME;
+            first_packet = 0;
+         }
+         else
+            buf->nFlags = OMX_BUFFERFLAG_TIME_UNKNOWN;
+
+         if(OMX_EmptyThisBuffer(ILC_GET_HANDLE(video_decode), buf) != OMX_ErrorNone)
+         {
+            status = -6;
+            break;
+         }
+      }
+
+      buf->nFilledLen = 0;
+      buf->nFlags = OMX_BUFFERFLAG_TIME_UNKNOWN | OMX_BUFFERFLAG_EOS;
+
+      if(OMX_EmptyThisBuffer(ILC_GET_HANDLE(video_decode), buf) != OMX_ErrorNone)
+         status = -20;
+
+      // need to flush the renderer to allow video_decode to disable its input port
+
+    if (oBufferHeader != NULL)
+    {
+    {
+      OMX_SendCommand(component, OMX_CommandPortDisable, oPortDef.nPortIndex, NULL);
+      OMX_FreeBuffer(component, 131, oBufferHeader);
+    };
+    ErrorCode = OMX_SendCommand(component, OMX_CommandPortEnable,
+                                    oPortDef.nPortIndex, NULL);
+
+    PortSettingsChanged = OMX_FALSE;
+
+    GetPortParam();
+
+    ErrorCode = OMX_AllocateBuffer(component, &oBufferHeader,
+                                       oPortDef.nPortIndex, NULL,
+                                           oPortDef.nBufferSize);
+
+    PortUpdated = OMX_TRUE;
+
+
+  if (PortUpdated == OMX_TRUE)
+  {
+    while (outf < inf)
+    {
+      OMX_FillThisBuffer(component, oBufferHeader);
+      if (OutputBufferFilled != OMX_TRUE) OMXWaitForFilled();
+      printf("Frame %u OUT.\n", outf);
+      outf ++;
+      OutputBufferFilled = OMX_FALSE;
+    };
+    decoder->frames->decoding_frame = outf ;
+  };
+//------------------------------------------
+//  End of changes
+//----------------------------------------
+
+        push_frame(decoder);
+}
     LOGD("End of frames");
 
-run_quit:
-    avformat_close_input(&format_ctx);
-run_finally_free_avio_ctx:
-    av_freep(&avio_ctx);
-run_finally_free_format_ctx:
-    avformat_free_context(format_ctx);
-run_finally_close_codec:
-    avcodec_close(codec_ctx);
-run_finally_free_codec_ctx:
-    avcodec_free_context(&codec_ctx);
-    notify_stopped();
 run_end:
     return 0;
 }
@@ -172,3 +223,10 @@ void decoder_stop(struct decoder *decoder) {
 void decoder_join(struct decoder *decoder) {
     SDL_WaitThread(decoder->thread, NULL);
 }
+
+
+
+
+
+
+
