@@ -27,11 +27,20 @@ struct args {
     uint16_t max_size;
     uint32_t bit_rate;
     bool always_on_top;
+#ifdef AUDIO_SUPPORT
+    SDL_bool forward_audio;
+#endif
 };
 
 static void usage(const char *arg0) {
     fprintf(stderr,
         "Usage: %s [options]\n"
+#ifdef AUDIO_SUPPORT
+        "\n"
+        "    -a, --forward-audio\n"
+        "        Forward audio from the device to the computer over USB\n"
+        "        (experimental).\n"
+#endif
         "\n"
         "Options:\n"
         "\n"
@@ -291,12 +300,26 @@ parse_args(struct args *args, int argc, char *argv[]) {
         {"serial",        required_argument, NULL, 's'},
         {"show-touches",  no_argument,       NULL, 't'},
         {"version",       no_argument,       NULL, 'v'},
+#ifdef AUDIO_SUPPORT
+        {"forward-audio", no_argument,       NULL, 'a'},
+#endif
         {NULL,            0,                 NULL, 0  },
     };
     int c;
-    while ((c = getopt_long(argc, argv, "b:c:fF:hm:nNp:r:s:tTv", long_options,
-                            NULL)) != -1) {
+#ifdef AUDIO_SUPPORT
+# define AUDIO_SHORT_PARAM "a"
+#else
+# define AUDIO_SHORT_PARAM
+#endif
+    while ((c = getopt_long(argc, argv, AUDIO_SHORT_PARAM "b:c:fhm:p:s:tv",
+                            long_options, NULL)) != -1) {
+
         switch (c) {
+#ifdef AUDIO_SUPPORT
+            case 'a':
+                args->forward_audio = SDL_TRUE;
+                break;
+#endif
             case 'b':
                 if (!parse_bit_rate(optarg, &args->bit_rate)) {
                     return false;
@@ -405,6 +428,9 @@ main(int argc, char *argv[]) {
         .port = DEFAULT_LOCAL_PORT,
         .max_size = DEFAULT_MAX_SIZE,
         .bit_rate = DEFAULT_BIT_RATE,
+#ifdef AUDIO_SUPPORT
+        .forward_audio = SDL_FALSE,
+#endif
         .always_on_top = false,
         .no_control = false,
         .no_display = false,
@@ -445,6 +471,9 @@ main(int argc, char *argv[]) {
         .bit_rate = args.bit_rate,
         .show_touches = args.show_touches,
         .fullscreen = args.fullscreen,
+#ifdef AUDIO_SUPPORT
+        .forward_audio = args.forward_audio,
+#endif
         .always_on_top = args.always_on_top,
         .no_control = args.no_control,
         .no_display = args.no_display,

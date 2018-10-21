@@ -7,6 +7,9 @@
 #include <sys/time.h>
 #include <SDL2/SDL.h>
 
+#include "config.h"
+#include "aoa.h"
+#include "audio.h"
 #include "command.h"
 #include "common.h"
 #include "controller.h"
@@ -34,6 +37,10 @@ static struct decoder decoder;
 static struct recorder recorder;
 static struct controller controller;
 static struct file_handler file_handler;
+
+#ifdef AUDIO_SUPPORT
+static struct audio_player audio_player;
+#endif
 
 static struct input_manager input_manager = {
     .controller = &controller,
@@ -264,6 +271,18 @@ scrcpy(const struct scrcpy_options *options) {
         return false;
     }
 
+    SDL_bool ret = SDL_TRUE;
+
+#ifdef AUDIO_SUPPORT
+    if (options->forward_audio) {
+        if (!audio_forwarding_start(&audio_player, options->serial)) {
+            ret = SDL_FALSE;
+            goto finally_destroy_server;
+        }
+    }
+#endif
+
+
     process_t proc_show_touches = PROCESS_NONE;
     bool show_touches_waited;
     if (options->show_touches) {
@@ -279,7 +298,7 @@ scrcpy(const struct scrcpy_options *options) {
 
     if (!sdl_init_and_configure(display)) {
         ret = false;
-        goto finally_destroy_server;
+        goto finally_revert_show_touches;
     }
 
     socket_t device_socket = server_connect_to(&server);
@@ -406,7 +425,7 @@ finally_destroy_video_buffer:
     if (display) {
         video_buffer_destroy(&video_buffer);
     }
-finally_destroy_server:
+finally_revert_show_touches:
     if (options->show_touches) {
         if (!show_touches_waited) {
             // wait the process which enabled "show touches"
@@ -417,7 +436,12 @@ finally_destroy_server:
                                                      false);
         wait_show_touches(proc_show_touches);
     }
-
+#ifdef AUDIO_SUPPORT
+    if (options->forward_audio) {
+        audio_forwarding_stop(&audio_player);
+    }
+#endif
+finally_destroy_server:
     server_destroy(&server);
 
     return ret;
